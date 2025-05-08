@@ -82,6 +82,7 @@ def download_pdf(note_id, paper_number):
 def fetch_papers():
     logger.info("Starting to fetch papers")
     submissions = []
+    paper_count = 0
     try:
         # Try multiple submission invitations
         for invitation in [
@@ -127,7 +128,6 @@ def fetch_papers():
                 title = note.content.get("title", {}).get("value", "") or "Unknown"
                 abstract = note.content.get("abstract", {}).get("value", "") or ""
                 authors = ", ".join(note.content.get("authors", {}).get("value", [])) or "Unknown"
-                keywords = ", ".join(note.content.get("keywords", {}).get("value", [])) or ""
                 pdf_path = download_pdf(note.id, note.number) if note.content.get("pdf") else None
 
                 paper = Paper(
@@ -142,18 +142,20 @@ def fetch_papers():
                     license="CC-BY"
                 )
                 session.merge(paper)
-                logger.debug(f"Processed paper: {title} (ID: {paper_id})")
+                session.commit()  # Commit immediately after processing each paper
+                paper_count += 1
+                logger.debug(f"Inserted paper: {title} (ID: {paper_id}, PDF: {pdf_path})")
             except Exception as e:
                 logger.error(f"Error processing paper {note.id}: {str(e)}")
+                session.rollback()  # Rollback only the current paper transaction
                 continue
 
-        session.commit()
-        logger.info("All papers inserted into database")
-        return len(unique_submissions)
+        logger.info(f"All papers inserted into database. Total: {paper_count}")
+        return paper_count
     except Exception as e:
         logger.error(f"Failed to fetch papers: {str(e)}")
         session.rollback()
-        return 0
+        return paper_count
 
 def fetch_reviews():
     logger.info("Starting to fetch reviews")
