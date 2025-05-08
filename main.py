@@ -56,18 +56,15 @@ except Exception as e:
     logger.error(f"Failed to initialize OpenReview client: {str(e)}")
     raise
 
-
 def check_profile():
     logger.info("Checking user profile to verify API authentication")
     try:
         profile = client.get_profile()
-        logger.info(
-            f"Successfully retrieved profile: ID={profile.id}, Email={profile.content.get('preferredEmail', 'N/A')}")
+        logger.info(f"Successfully retrieved profile: ID={profile.id}, Email={profile.content.get('preferredEmail', 'N/A')}")
         return True
     except Exception as e:
         logger.error(f"Failed to retrieve profile: {str(e)}")
         return False
-
 
 def download_pdf(note_id, paper_number):
     logger.debug(f"Downloading PDF for note_id: {note_id}, paper_number: {paper_number}")
@@ -82,39 +79,55 @@ def download_pdf(note_id, paper_number):
         logger.error(f"Failed to download PDF for note_id {note_id}: {str(e)}")
         return None
 
-
 def fetch_papers():
     logger.info("Starting to fetch papers")
+    submissions = []
     try:
-        # Try fetching submissions using invitation
-        submissions = client.get_all_notes(invitation=f"{VENUE_ID}/-/Submission")
-        logger.info(f"Retrieved {len(submissions)} submissions using invitation {VENUE_ID}/-/Submission")
+        # Try multiple submission invitations
+        for invitation in [
+            f"{VENUE_ID}/-/Submission",
+            f"{VENUE_ID}/-/Blind_Submission",
+            f"{VENUE_ID}/-/ARR_Commitment",
+            f"{VENUE_ID}/-/Direct_Submission"
+        ]:
+            try:
+                subs = client.get_all_notes(invitation=invitation)
+                submissions.extend(subs)
+                logger.info(f"Retrieved {len(subs)} submissions using invitation {invitation}")
+            except Exception as e:
+                logger.warning(f"No submissions for {invitation}: {str(e)}")
 
-        # If no submissions, try venueid
+        # Try venueid as fallback
         if not submissions:
-            logger.warning("No submissions found with invitation. Trying venueid.")
+            logger.warning("No submissions found with invitations. Trying venueid.")
             submissions = client.get_all_notes(content={'venueid': VENUE_ID})
             logger.info(f"Retrieved {len(submissions)} submissions using venueid {VENUE_ID}")
 
-        # If still no submissions, try ARR-related submissions
+        # Try alternative venueid
         if not submissions:
-            logger.warning("No submissions found with venueid. Trying ARR commitment.")
-            submissions = client.get_all_notes(invitation=f"{VENUE_ID}/-/ARR_Commitment")
-            logger.info(f"Retrieved {len(submissions)} submissions using ARR commitment")
+            alt_venue_id = "aclweb.org/EMNLP/2023/Conference"
+            logger.warning(f"No submissions found with {VENUE_ID}. Trying alternative venueid {alt_venue_id}.")
+            submissions = client.get_all_notes(content={'venueid': alt_venue_id})
+            logger.info(f"Retrieved {len(submissions)} submissions using venueid {alt_venue_id}")
 
         # Debug: Log invitation details
         try:
             invitation = client.get_invitation(f"{VENUE_ID}/-/Submission")
             logger.debug(f"Submission invitation details: {invitation.id}, due_date={invitation.duedate}")
         except Exception as e:
-            logger.warning(f"Could not retrieve submission invitation: {str(e)}")
+            logger.warning(f"Could not retrieve Submission invitation: {str(e)}")
 
-        for note in submissions:
+        # Deduplicate submissions by ID
+        unique_submissions = {note.id: note for note in submissions}.values()
+        logger.info(f"Total unique submissions: {len(unique_submissions)}")
+
+        for note in unique_submissions:
             try:
                 paper_id = note.id
-                title = note.content.get("title", {}).get("value", "")
-                abstract = note.content.get("abstract", {}).get("value", "")
-                authors = ", ".join(note.content.get("authors", {}).get("value", []))
+                title = note.content.get("title", {}).get("value", "") or "Unknown"
+                abstract = note.content.get("abstract", {}).get("value", "") or ""
+                authors = ", ".join(note.content.get("authors", {}).get("value", [])) or "Unknown"
+                keywords = ", ".join(note.content.get("keywords", {}).get("value", [])) or ""
                 pdf_path = download_pdf(note.id, note.number) if note.content.get("pdf") else None
 
                 paper = Paper(
@@ -136,35 +149,45 @@ def fetch_papers():
 
         session.commit()
         logger.info("All papers inserted into database")
-        return len(submissions)
+        return len(unique_submissions)
     except Exception as e:
         logger.error(f"Failed to fetch papers: {str(e)}")
         session.rollback()
         return 0
 
-
 def fetch_reviews():
     logger.info("Starting to fetch reviews")
+    reviews = []
     try:
-        # Try fetching reviews using invitation
-        reviews = client.get_all_notes(invitation=f"{VENUE_ID}/-/Official_Review")
-        logger.info(f"Retrieved {len(reviews)} reviews using invitation {VENUE_ID}/-/Official_Review")
+        # Try multiple review invitations
+        for invitation in [
+            f"{VENUE_ID}/-/Official_Review",
+            f"{VENUE_ID}/-/ARR_Review",
+            f"{VENUE_ID}/-/Review"
+        ]:
+            try:
+                revs = client.get_all_notes(invitation=invitation)
+                reviews.extend(revs)
+                logger.info(f"Retrieved {len(revs)} reviews using invitation {invitation}")
+            except Exception as e:
+                logger.warning(f"No reviews for {invitation}: {str(e)}")
 
-        # If no reviews, try ARR reviews
-        if not reviews:
-            logger.warning("No reviews found with invitation. Trying ARR reviews.")
-            reviews = client.get_all_notes(invitation=f"{VENUE_ID}/-/ARR_Review")
-            logger.info(f"Retrieved {len(reviews)} reviews using ARR reviews")
+        # Deduplicate reviews by ID
+        unique_reviews = {rev.id: rev for rev in reviews}.values()
+        logger.info(f"Total unique reviews: {len(unique_reviews)}")
 
-        for rev in reviews:
+        for rev in unique_reviews:
             try:
                 review_id = rev.id
                 paper_id = rev.forum
                 reviewer_id = rev.signatures[0] if rev.signatures else None
-                review_text = rev.content.get("review", {}).get("value", "")
-                review_date = datetime.fromtimestamp(rev.tcdate / 1000).date()
-                overall_score = rev.content.get("overall assessment", {}).get("value", "")
-                confidence_score = rev.content.get("confidence", {}).get("value", "")
+                review_text = rev.content.get("review", {}).get("value", "") or ""
+                review_date = datetime.fromtimestamp(rev.tcdate / 1000).date() if rev.tcdate else datetime.now().date()
+                overall_score = (
+                    rev.content.get("overall assessment", {}).get("value", "") or
+                    rev.content.get("recommendation", {}).get("value", "") or ""
+                )
+                confidence_score = rev.content.get("confidence", {}).get("value", "") or ""
                 review_structure = "structured" if len(rev.content) > 5 else "unstructured"
 
                 review = Review(
@@ -193,29 +216,36 @@ def fetch_reviews():
 
         session.commit()
         logger.info("All reviews inserted into database")
-        return len(reviews)
+        return len(unique_reviews)
     except Exception as e:
         logger.error(f"Failed to fetch reviews: {str(e)}")
         session.rollback()
         return 0
 
-
 def fetch_decisions():
     logger.info("Starting to fetch decisions")
+    decisions = []
     try:
-        # Try fetching decisions using invitation
-        decisions = client.get_all_notes(invitation=f"{VENUE_ID}/-/Decision")
-        logger.info(f"Retrieved {len(decisions)} decisions using invitation {VENUE_ID}/-/Decision")
-
-        # If no decisions, try ARR decisions
-        if not decisions:
-            logger.warning("No decisions found with invitation. Trying ARR decisions.")
-            decisions = client.get_all_notes(invitation=f"{VENUE_ID}/-/ARR_Decision")
-            logger.info(f"Retrieved {len(decisions)} decisions using ARR decisions")
-
-        for d in decisions:
+        # Try multiple decision invitations
+        for invitation in [
+            f"{VENUE_ID}/-/Decision",
+            f"{VENUE_ID}/-/ARR_Decision",
+            f"{VENUE_ID}/-/Acceptance_Decision"
+        ]:
             try:
-                decision = d.content.get("decision", {}).get("value", "")
+                decs = client.get_all_notes(invitation=invitation)
+                decisions.extend(decs)
+                logger.info(f"Retrieved {len(decs)} decisions using invitation {invitation}")
+            except Exception as e:
+                logger.warning(f"No decisions for {invitation}: {str(e)}")
+
+        # Deduplicate decisions by ID
+        unique_decisions = {d.id: d for d in decisions}.values()
+        logger.info(f"Total unique decisions: {len(unique_decisions)}")
+
+        for d in unique_decisions:
+            try:
+                decision = d.content.get("decision", {}).get("value", "") or ""
                 paper = session.get(Paper, d.forum)
                 if paper:
                     paper.acceptance_status = decision
@@ -228,12 +258,11 @@ def fetch_decisions():
 
         session.commit()
         logger.info("All decisions updated in database")
-        return len(decisions)
+        return len(unique_decisions)
     except Exception as e:
         logger.error(f"Failed to fetch decisions: {str(e)}")
         session.rollback()
         return 0
-
 
 if __name__ == "__main__":
     try:
@@ -251,13 +280,22 @@ if __name__ == "__main__":
         review_count = fetch_reviews()
         decision_count = fetch_decisions()
 
-        if paper_count == 0 and review_count == 0 and decision_count == 0:
+        if paper_count == 0:
             logger.warning(
-                "No data retrieved. Possible issues: incorrect VENUE_ID, no public data, or API restrictions.")
-            print("⚠️ Warning: No papers, reviews, or decisions retrieved. Check VENUE_ID or API access.")
+                "No papers retrieved. Possible issues: incorrect VENUE_ID, no public data, or API restrictions. "
+                "Try 'aclweb.org/EMNLP/2023/Conference' or contact OpenReview support."
+            )
+            print(
+                "⚠️ Warning: No papers retrieved. Check VENUE_ID, API access, or try manual data download from OpenReview."
+            )
+        elif review_count == 0 or decision_count == 0:
+            logger.warning(
+                "Partial data retrieved. Reviews or decisions may not be public. Check OpenReview for availability."
+            )
+            print("⚠️ Warning: Retrieved papers but missing reviews or decisions. Verify public data availability.")
 
         logger.info(f"Execution {execution_id} completed successfully")
-        print("✅ Done.")
+        print(f"✅ Done. Retrieved {paper_count} papers, {review_count} reviews, {decision_count} decisions.")
     except Exception as e:
         logger.error(f"Execution failed: {str(e)}")
         print(f"❌ Failed: {str(e)}")
