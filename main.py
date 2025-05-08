@@ -29,7 +29,7 @@ PASSWORD = os.getenv("OPENREVIEW_PASSWORD")
 
 # Constants
 DB_PATH = 'sqlite:///data/nlpeer.db'
-VENUE_ID = "EMNLP.cc/2023/Conference"
+VENUE_ID = "EMNLP/2023/Conference"
 PDF_DIR = "data/pdfs"
 os.makedirs(PDF_DIR, exist_ok=True)
 
@@ -86,8 +86,28 @@ def download_pdf(note_id, paper_number):
 def fetch_papers():
     logger.info("Starting to fetch papers")
     try:
+        # Try fetching submissions using invitation
         submissions = client.get_all_notes(invitation=f"{VENUE_ID}/-/Submission")
-        logger.info(f"Retrieved {len(submissions)} submissions")
+        logger.info(f"Retrieved {len(submissions)} submissions using invitation {VENUE_ID}/-/Submission")
+
+        # If no submissions, try venueid
+        if not submissions:
+            logger.warning("No submissions found with invitation. Trying venueid.")
+            submissions = client.get_all_notes(content={'venueid': VENUE_ID})
+            logger.info(f"Retrieved {len(submissions)} submissions using venueid {VENUE_ID}")
+
+        # If still no submissions, try ARR-related submissions
+        if not submissions:
+            logger.warning("No submissions found with venueid. Trying ARR commitment.")
+            submissions = client.get_all_notes(invitation=f"{VENUE_ID}/-/ARR_Commitment")
+            logger.info(f"Retrieved {len(submissions)} submissions using ARR commitment")
+
+        # Debug: Log invitation details
+        try:
+            invitation = client.get_invitation(f"{VENUE_ID}/-/Submission")
+            logger.debug(f"Submission invitation details: {invitation.id}, due_date={invitation.duedate}")
+        except Exception as e:
+            logger.warning(f"Could not retrieve submission invitation: {str(e)}")
 
         for note in submissions:
             try:
@@ -95,7 +115,7 @@ def fetch_papers():
                 title = note.content.get("title", {}).get("value", "")
                 abstract = note.content.get("abstract", {}).get("value", "")
                 authors = ", ".join(note.content.get("authors", {}).get("value", []))
-                pdf_path = download_pdf(note.id, note.number)
+                pdf_path = download_pdf(note.id, note.number) if note.content.get("pdf") else None
 
                 paper = Paper(
                     paper_id=paper_id,
@@ -116,16 +136,25 @@ def fetch_papers():
 
         session.commit()
         logger.info("All papers inserted into database")
+        return len(submissions)
     except Exception as e:
         logger.error(f"Failed to fetch papers: {str(e)}")
         session.rollback()
+        return 0
 
 
 def fetch_reviews():
     logger.info("Starting to fetch reviews")
     try:
+        # Try fetching reviews using invitation
         reviews = client.get_all_notes(invitation=f"{VENUE_ID}/-/Official_Review")
-        logger.info(f"Retrieved {len(reviews)} reviews")
+        logger.info(f"Retrieved {len(reviews)} reviews using invitation {VENUE_ID}/-/Official_Review")
+
+        # If no reviews, try ARR reviews
+        if not reviews:
+            logger.warning("No reviews found with invitation. Trying ARR reviews.")
+            reviews = client.get_all_notes(invitation=f"{VENUE_ID}/-/ARR_Review")
+            logger.info(f"Retrieved {len(reviews)} reviews using ARR reviews")
 
         for rev in reviews:
             try:
@@ -164,16 +193,25 @@ def fetch_reviews():
 
         session.commit()
         logger.info("All reviews inserted into database")
+        return len(reviews)
     except Exception as e:
         logger.error(f"Failed to fetch reviews: {str(e)}")
         session.rollback()
+        return 0
 
 
 def fetch_decisions():
     logger.info("Starting to fetch decisions")
     try:
+        # Try fetching decisions using invitation
         decisions = client.get_all_notes(invitation=f"{VENUE_ID}/-/Decision")
-        logger.info(f"Retrieved {len(decisions)} decisions")
+        logger.info(f"Retrieved {len(decisions)} decisions using invitation {VENUE_ID}/-/Decision")
+
+        # If no decisions, try ARR decisions
+        if not decisions:
+            logger.warning("No decisions found with invitation. Trying ARR decisions.")
+            decisions = client.get_all_notes(invitation=f"{VENUE_ID}/-/ARR_Decision")
+            logger.info(f"Retrieved {len(decisions)} decisions using ARR decisions")
 
         for d in decisions:
             try:
@@ -190,9 +228,11 @@ def fetch_decisions():
 
         session.commit()
         logger.info("All decisions updated in database")
+        return len(decisions)
     except Exception as e:
         logger.error(f"Failed to fetch decisions: {str(e)}")
         session.rollback()
+        return 0
 
 
 if __name__ == "__main__":
@@ -206,9 +246,15 @@ if __name__ == "__main__":
             print("❌ Failed: Unable to retrieve profile. Check credentials or API connectivity.")
             raise Exception("Profile retrieval failed")
 
-        fetch_papers()
-        fetch_reviews()
-        fetch_decisions()
+        # Fetch data and check results
+        paper_count = fetch_papers()
+        review_count = fetch_reviews()
+        decision_count = fetch_decisions()
+
+        if paper_count == 0 and review_count == 0 and decision_count == 0:
+            logger.warning(
+                "No data retrieved. Possible issues: incorrect VENUE_ID, no public data, or API restrictions.")
+            print("⚠️ Warning: No papers, reviews, or decisions retrieved. Check VENUE_ID or API access.")
 
         logger.info(f"Execution {execution_id} completed successfully")
         print("✅ Done.")
