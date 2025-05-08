@@ -81,12 +81,14 @@ def download_pdf(note_id, paper_number):
         logger.error(f"Failed to download PDF for note_id {note_id}: {str(e)}")
         return None
 
-def fetch_papers():
-    logger.info("Starting to fetch papers")
-    submissions = []
+def fetch_paper_and_reviews():
+    logger.info("Starting to fetch papers and reviews sequentially")
     paper_count = 0
+    review_count = 0
+    decision_count = 0
     try:
-        # Try multiple submission invitations
+        # Fetch submissions using multiple invitation types
+        submissions = []
         for invitation in [
             f"{VENUE_ID}/-/Submission",
             f"{VENUE_ID}/-/Blind_Submission",
@@ -100,7 +102,7 @@ def fetch_papers():
             except Exception as e:
                 logger.warning(f"No submissions for {invitation}: {str(e)}")
 
-        # Try venueid as fallback
+        # Fallback to venueid
         if not submissions:
             logger.warning("No submissions found with invitations. Trying venueid.")
             submissions = client.get_all_notes(content={'venueid': VENUE_ID})
@@ -113,34 +115,29 @@ def fetch_papers():
             submissions = client.get_all_notes(content={'venueid': alt_venue_id})
             logger.info(f"Retrieved {len(submissions)} submissions using venueid {alt_venue_id}")
 
-        # Debug: Log invitation details
-        try:
-            invitation = client.get_invitation(f"{VENUE_ID}/-/Submission")
-            logger.debug(f"Submission invitation details: {invitation.id}, due_date={invitation.duedate}")
-        except Exception as e:
-            logger.warning(f"Could not retrieve Submission invitation: {str(e)}")
-
         # Deduplicate submissions by ID
         unique_submissions = {note.id: note for note in submissions}.values()
         total_submissions = len(unique_submissions)
         logger.info(f"Total unique submissions: {total_submissions}")
 
-        # Process papers in batches to reduce database locking
-        batch_size = 50
+        # Process each paper one by one
         for i, note in enumerate(unique_submissions, 1):
             try:
                 paper_id = note.id
+                logger.info(f"Processing paper {i}/{total_submissions}: {paper_id}")
+
                 # Skip if paper already exists
                 if session.query(Paper).filter_by(paper_id=paper_id).first():
                     logger.debug(f"Skipping paper ID {paper_id}: already in database")
-                    paper_count += 1
                     continue
 
+                # Fetch paper details
                 title = note.content.get("title", {}).get("value", "") or "Unknown"
                 abstract = note.content.get("abstract", {}).get("value", "") or ""
                 authors = ", ".join(note.content.get("authors", {}).get("value", [])) or "Unknown"
                 pdf_path = download_pdf(note.id, note.number) if note.content.get("pdf") else None
 
+                # Store paper in database
                 paper = Paper(
                     paper_id=paper_id,
                     title=title,
@@ -153,157 +150,117 @@ def fetch_papers():
                     license="CC-BY"
                 )
                 session.merge(paper)
-                session.commit()
                 paper_count += 1
-                logger.info(f"Inserted paper {i}/{total_submissions}: {title} (ID: {paper_id}, PDF: {pdf_path})")
+                logger.info(f"Inserted paper: {title} (ID: {paper_id}, PDF: {pdf_path})")
 
-                # Commit batch every batch_size papers
-                if i % batch_size == 0:
-                    logger.debug(f"Committing batch at paper {i}")
-                    session.commit()
+                # Fetch reviews for this paper
+                reviews = []
+                for invitation in [
+                    f"{VENUE_ID}/-/Official_Review",
+                    f"{VENUE_ID}/-/ARR_Review",
+                    f"{VENUE_ID}/-/Review",
+                    f"{VENUE_ID}/-/Public_Review",
+                    f"{VENUE_ID}/-/Paper_Review",
+                    f"{VENUE_ID}/-/Anonymous_Review"
+                ]:
+                    try:
+                        revs = client.get_all_notes(invitation=invitation, forum=paper_id)
+                        reviews.extend(revs)
+                        logger.debug(f"Retrieved {len(revs)} reviews for paper {paper_id} using invitation {invitation}")
+                    except Exception as e:
+                        logger.warning(f"No reviews for {invitation} for paper {paper_id}: {str(e)}")
+
+                # Process reviews
+                for rev in reviews:
+                    try:
+                        review_id = rev.id
+                        # Skip if review already exists
+                        if session.query(Review).filter_by(review_id=review_id).first():
+                            logger.debug(f"Skipping review ID {review_id}: already in database")
+                            continue
+
+                        reviewer_id = rev.signatures[0] if rev.signatures else None
+                        review_text = rev.content.get("review", {}).get("value", "") or ""
+                        review_date = datetime.fromtimestamp(rev.tcdate / 1000).date() if rev.tcdate else datetime.now().date()
+                        overall_score = (
+                            rev.content.get("overall assessment", {}).get("value", "") or
+                            rev.content.get("recommendation", {}).get("value", "") or
+                            rev.content.get("overall_evaluation", {}).get("value", "") or ""
+                        )
+                        confidence_score = rev.content.get("confidence", {}).get("value", "") or ""
+                        review_structure = "structured" if len(rev.content) > 5 else "unstructured"
+
+                        review = Review(
+                            review_id=review_id,
+                            paper_id=paper_id,
+                            reviewer_id=reviewer_id,
+                            review_text=review_text,
+                            review_date=review_date,
+                            overall_score=overall_score,
+                            confidence_score=confidence_score,
+                            review_structure=review_structure
+                        )
+                        session.merge(review)
+
+                        mapping = PaperReviewMapping(
+                            paper_id=paper_id,
+                            review_id=review_id,
+                            reviewer_role="reviewer",
+                            review_round=1
+                        )
+                        session.merge(mapping)
+                        review_count += 1
+                        logger.info(f"Inserted review {review_id} for paper {paper_id}")
+                    except Exception as e:
+                        logger.error(f"Error processing review {rev.id} for paper {paper_id}: {str(e)}")
+                        session.rollback()
+                        continue
+
+                # Fetch decision for this paper
+                decisions = []
+                for invitation in [
+                    f"{VENUE_ID}/-/Decision",
+                    f"{VENUE_ID}/-/ARR_Decision",
+                    f"{VENUE_ID}/-/Acceptance_Decision",
+                    f"{VENUE_ID}/-/Program_Committee_Decision"
+                ]:
+                    try:
+                        decs = client.get_all_notes(invitation=invitation, forum=paper_id)
+                        decisions.extend(decs)
+                        logger.debug(f"Retrieved {len(decs)} decisions for paper {paper_id} using invitation {invitation}")
+                    except Exception as e:
+                        logger.warning(f"No decisions for {invitation} for paper {paper_id}: {str(e)}")
+
+                for d in decisions:
+                    try:
+                        decision = d.content.get("decision", {}).get("value", "") or ""
+                        paper = session.get(Paper, paper_id)
+                        if paper:
+                            paper.acceptance_status = decision
+                            decision_count += 1
+                            logger.info(f"Updated decision for paper {paper_id}: {decision}")
+                        else:
+                            logger.warning(f"No paper found for decision {paper_id}")
+                    except Exception as e:
+                        logger.error(f"Error processing decision {d.id} for paper {paper_id}: {str(e)}")
+                        session.rollback()
+                        continue
+
+                # Commit after processing paper, reviews, and decisions
+                session.commit()
+                logger.info(f"Completed processing paper {i}/{total_submissions}: {paper_id}")
             except Exception as e:
-                logger.error(f"Error processing paper {note.id}: {str(e)}")
-                session.rollback()
-                continue
-
-        session.commit()  # Final commit for any remaining papers
-        logger.info(f"All papers inserted into database. Total: {paper_count}")
-        return paper_count
-    except Exception as e:
-        logger.error(f"Failed to fetch papers: {str(e)}")
-        session.rollback()
-        return paper_count
-
-def fetch_reviews():
-    logger.info("Starting to fetch reviews")
-    reviews = []
-    try:
-        # Try multiple review invitations
-        for invitation in [
-            f"{VENUE_ID}/-/Official_Review",
-            f"{VENUE_ID}/-/ARR_Review",
-            f"{VENUE_ID}/-/Review",
-            f"{VENUE_ID}/-/Public_Review",
-            f"{VENUE_ID}/-/Paper_Review",
-            f"{VENUE_ID}/-/Anonymous_Review"
-        ]:
-            try:
-                revs = client.get_all_notes(invitation=invitation)
-                reviews.extend(revs)
-                logger.info(f"Retrieved {len(revs)} reviews using invitation {invitation}")
-                # Log sample review content for debugging
-                if revs:
-                    logger.debug(f"Sample review content: {revs[0].content}")
-            except Exception as e:
-                logger.warning(f"No reviews for {invitation}: {str(e)}")
-
-        # Deduplicate reviews by ID
-        unique_reviews = {rev.id: rev for rev in reviews}.values()
-        total_reviews = len(unique_reviews)
-        logger.info(f"Total unique reviews: {total_reviews}")
-
-        for i, rev in enumerate(unique_reviews, 1):
-            try:
-                review_id = rev.id
-                # Skip if review already exists
-                if session.query(Review).filter_by(review_id=review_id).first():
-                    logger.debug(f"Skipping review ID {review_id}: already in database")
-                    continue
-
-                paper_id = rev.forum
-                reviewer_id = rev.signatures[0] if rev.signatures else None
-                review_text = rev.content.get("review", {}).get("value", "") or ""
-                review_date = datetime.fromtimestamp(rev.tcdate / 1000).date() if rev.tcdate else datetime.now().date()
-                overall_score = (
-                    rev.content.get("overall assessment", {}).get("value", "") or
-                    rev.content.get("recommendation", {}).get("value", "") or
-                    rev.content.get("overall_evaluation", {}).get("value", "") or ""
-                )
-                confidence_score = rev.content.get("confidence", {}).get("value", "") or ""
-                review_structure = "structured" if len(rev.content) > 5 else "unstructured"
-
-                review = Review(
-                    review_id=review_id,
-                    paper_id=paper_id,
-                    reviewer_id=reviewer_id,
-                    review_text=review_text,
-                    review_date=review_date,
-                    overall_score=overall_score,
-                    confidence_score=confidence_score,
-                    review_structure=review_structure
-                )
-                session.merge(review)
-
-                mapping = PaperReviewMapping(
-                    paper_id=paper_id,
-                    review_id=review_id,
-                    reviewer_role="reviewer",
-                    review_round=1
-                )
-                session.merge(mapping)
-                session.commit()  # Commit per review to ensure data is saved
-                logger.info(f"Inserted review {i}/{total_reviews}: {review_id} for paper: {paper_id}")
-            except Exception as e:
-                logger.error(f"Error processing review {rev.id}: {str(e)}")
-                session.rollback()
-                continue
-
-        session.commit()
-        logger.info("All reviews inserted into database")
-        return total_reviews
-    except Exception as e:
-        logger.error(f"Failed to fetch reviews: {str(e)}")
-        session.rollback()
-        return 0
-
-def fetch_decisions():
-    logger.info("Starting to fetch decisions")
-    decisions = []
-    try:
-        # Try multiple decision invitations
-        for invitation in [
-            f"{VENUE_ID}/-/Decision",
-            f"{VENUE_ID}/-/ARR_Decision",
-            f"{VENUE_ID}/-/Acceptance_Decision",
-            f"{VENUE_ID}/-/Program_Committee_Decision"
-        ]:
-            try:
-                decs = client.get_all_notes(invitation=invitation)
-                decisions.extend(decs)
-                logger.info(f"Retrieved {len(decs)} decisions using invitation {invitation}")
-                # Log sample decision content for debugging
-                if decs:
-                    logger.debug(f"Sample decision content: {decs[0].content}")
-            except Exception as e:
-                logger.warning(f"No decisions for {invitation}: {str(e)}")
-
-        # Deduplicate decisions by ID
-        unique_decisions = {d.id: d for d in decisions}.values()
-        total_decisions = len(unique_decisions)
-        logger.info(f"Total unique decisions: {total_decisions}")
-
-        for i, d in enumerate(unique_decisions, 1):
-            try:
-                decision = d.content.get("decision", {}).get("value", "") or ""
-                paper = session.get(Paper, d.forum)
-                if paper:
-                    paper.acceptance_status = decision
-                    session.commit()
-                    logger.info(f"Updated decision {i}/{total_decisions} for paper {d.forum}: {decision}")
-                else:
-                    logger.warning(f"No paper found for decision {d.forum}")
-            except Exception as e:
-                logger.error(f"Error processing decision {d.id}: {str(e)}")
+                logger.error(f"Error processing paper {paper_id}: {str(e)}")
                 session.rollback()
                 continue
 
         session.commit()
-        logger.info("All decisions updated in database")
-        return total_decisions
+        logger.info(f"All papers and reviews processed. Total: {paper_count} papers, {review_count} reviews, {decision_count} decisions")
+        return paper_count, review_count, decision_count
     except Exception as e:
-        logger.error(f"Failed to fetch decisions: {str(e)}")
+        logger.error(f"Failed to fetch papers and reviews: {str(e)}")
         session.rollback()
-        return 0
+        return paper_count, review_count, decision_count
 
 if __name__ == "__main__":
     try:
@@ -316,10 +273,8 @@ if __name__ == "__main__":
             print("❌ Failed: Unable to retrieve profile. Check credentials or API connectivity.")
             raise Exception("Profile retrieval failed")
 
-        # Fetch data and check results
-        paper_count = fetch_papers()
-        review_count = fetch_reviews()
-        decision_count = fetch_decisions()
+        # Fetch papers and reviews
+        paper_count, review_count, decision_count = fetch_paper_and_reviews()
 
         # Verify database state
         db_paper_count = session.query(Paper).count()
