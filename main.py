@@ -57,6 +57,18 @@ except Exception as e:
     raise
 
 
+def check_profile():
+    logger.info("Checking user profile to verify API authentication")
+    try:
+        profile = client.get_profile()
+        logger.info(
+            f"Successfully retrieved profile: ID={profile.id}, Email={profile.content.get('preferredEmail', 'N/A')}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to retrieve profile: {str(e)}")
+        return False
+
+
 def download_pdf(note_id, paper_number):
     logger.debug(f"Downloading PDF for note_id: {note_id}, paper_number: {paper_number}")
     try:
@@ -187,6 +199,12 @@ if __name__ == "__main__":
     try:
         execution_id = str(uuid4())
         logger.info(f"Starting execution with ID: {execution_id}")
+
+        # Check profile to verify API authentication
+        if not check_profile():
+            logger.error("Aborting execution due to profile retrieval failure")
+            print("❌ Failed: Unable to retrieve profile. Check credentials or API connectivity.")
+            raise Exception("Profile retrieval failed")
 
         fetch_papers()
         fetch_reviews()
